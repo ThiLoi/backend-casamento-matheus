@@ -14,6 +14,8 @@ const mpConfig = new MercadoPagoConfig({
   accessToken: process.env.MP_ACCESS_TOKEN,
 });
 
+console.log("Verificação do Token MP:", process.env.MP_ACCESS_TOKEN ? `Preenchido (Começa com: ${process.env.MP_ACCESS_TOKEN.substring(0, 15)}...)` : "VAZIO ❌");
+
 // 1. RASTREADOR: Regista todos os pedidos que chegam ao servidor
 app.use((req, res, next) => {
   console.log(`\n[${req.method}] Recebido no caminho: ${req.url}`);
