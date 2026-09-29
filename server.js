@@ -1,97 +1,94 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import crypto from 'crypto';
 import { MercadoPagoConfig, Payment } from 'mercadopago';
 import { db } from './db.js';
-import { PRODUTOS } from './produtos.js';
 
 dotenv.config();
 
 const app = express();
-
-// Restringe o CORS ao domínio do site em produção.
-// Define FRONTEND_URL no .env (ex: https://o-teu-site.com). Em dev, sem a
-// variável definida, aceita qualquer origem para não travar o localhost.
-app.use(
-  cors({
-    origin: process.env.FRONTEND_URL || true,
-  }),
-);
+app.use(cors());
 app.use(express.json());
 
-// Inicializa o Mercado Pago com a chave privada
 const mpConfig = new MercadoPagoConfig({
   accessToken: process.env.MP_ACCESS_TOKEN,
 });
 
-// Rota para processar o pagamento com segurança
+// 1. RASTREADOR: Regista todos os pedidos que chegam ao servidor
+app.use((req, res, next) => {
+  console.log(`\n[${req.method}] Recebido no caminho: ${req.url}`);
+  next();
+});
+
 app.post('/api/processar-pagamento', async (req, res) => {
-  const { paymentData, produtoId, nomeConvidado, mensagemNoivos } = req.body;
+  console.log("=== INÍCIO DO PROCESSAMENTO DO PAGAMENTO ===");
+  console.log("📦 Dados recebidos do frontend:", JSON.stringify(req.body, null, 2));
 
-  // O preço NUNCA vem do cliente. É sempre resolvido aqui, a partir do
-  // catálogo do servidor, usando apenas o id do presente escolhido.
-  const produto = PRODUTOS[produtoId];
-  if (!produto) {
-    return res.status(400).json({ message: 'Presente inválido.' });
-  }
-
-  const client = await db.connect();
-
+  let client;
   try {
+    console.log("🔄 A tentar ligar à base de dados Supabase...");
+    client = await db.connect(); // Agora está protegido dentro do 'try'
+    console.log("✅ Ligação à base de dados efetuada com sucesso!");
+
+    const { paymentData, presenteNome, valor, nomeConvidado, mensagemNoivos } = req.body;
+
+    if (!paymentData || !valor) {
+      console.log("❌ Erro: Dados em falta no req.body!");
+      return res.status(400).json({ message: "Dados do presente incompletos." });
+    }
+
     const payment = new Payment(mpConfig);
 
-    // Chave de idempotência: evita que um retry de rede crie um segundo
-    // pagamento cobrado ao convidado.
-    const idempotencyKey = crypto.randomUUID();
-
-    // Cria a intenção de pagamento no Mercado Pago protegendo contra campos nulos
-    const mpResponse = await payment.create(
-      {
-        body: {
-          transaction_amount: produto.preco,
-          token: paymentData?.token, // Protegido para suportar Pix e Cartão
-          description: `Presente: ${produto.nome}`,
-          installments: Number(paymentData?.installments) || 1,
-          payment_method_id: paymentData?.payment_method_id,
-          issuer_id: paymentData?.issuer_id,
-          payer: {
-            email: paymentData?.payer?.email || 'convidado_casamento@teste.com',
-            first_name: nomeConvidado || 'Convidado',
-            identification: paymentData?.payer?.identification || undefined,
-          },
+    console.log("🔄 A enviar pedido para a API do Mercado Pago...");
+    const mpResponse = await payment.create({
+      body: {
+        transaction_amount: Number(valor),
+        token: paymentData?.token,
+        description: `Presente: ${presenteNome}`,
+        installments: Number(paymentData?.installments) || 1,
+        payment_method_id: paymentData?.payment_method_id,
+        issuer_id: paymentData?.issuer_id,
+        payer: {
+          email: paymentData?.payer?.email || 'convidado_casamento@teste.com',
+          first_name: nomeConvidado || 'Convidado',
+          identification: paymentData?.payer?.identification || undefined,
         },
       },
-      { idempotencyKey },
-    );
+    });
+    console.log("✅ Pagamento criado no MP! ID da transação:", mpResponse.id);
 
-    // Guarda na base de dados a mensagem e o estado inicial.
-    // presente_nome e valor vêm do catálogo do servidor, não do req.body.
+    console.log("🔄 A guardar registo do presente na base de dados...");
     await client.query(
       `INSERT INTO pedidos_presentes 
         (mercado_pago_id, presente_nome, nome_convidado, mensagem, valor, status_pagamento) 
        VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         String(mpResponse.id),
-        produto.nome,
+        presenteNome,
         nomeConvidado,
         mensagemNoivos,
-        produto.preco,
+        valor,
         mpResponse.status,
       ]
     );
+    console.log("✅ Registo guardado com sucesso no Supabase!");
 
     return res.status(200).json(mpResponse);
   } catch (error) {
-    console.error('Erro no pagamento:', error);
-    return res.status(500).json({ message: 'Erro interno', error: error.message });
+    console.error('❌ ERRO GRAVE NO BACKEND DETETADO:', error);
+    // Se for erro do MP, enviamos para o frontend para saber qual foi o motivo
+    const errorMessage = error.message || 'Erro interno do servidor';
+    return res.status(400).json({ message: errorMessage, detalhes: error });
   } finally {
-    client.release();
+    if (client) {
+      client.release();
+      console.log("🔒 Ligação à base de dados encerrada.");
+    }
   }
 });
 
-// Rota de Webhook para atualizar o estado do pagamento e marcar o presente como comprado
 app.post('/api/webhooks/mercadopago', async (req, res) => {
+  // Mantemos o webhook igual...
   const { type, data } = req.body;
   res.status(200).send('OK');
 
@@ -99,28 +96,28 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
     try {
       const payment = new Payment(mpConfig);
       const paymentDetails = await payment.get({ id: data.id });
-      const client = await db.connect();
+      const webhookClient = await db.connect();
 
-      await client.query(
+      await webhookClient.query(
         `UPDATE pedidos_presentes SET status_pagamento = $1 WHERE mercado_pago_id = $2`,
         [paymentDetails.status, String(paymentDetails.id)]
       );
 
       if (paymentDetails.status === 'approved') {
-        const result = await client.query(
+        const result = await webhookClient.query(
           `SELECT presente_nome FROM pedidos_presentes WHERE mercado_pago_id = $1`,
           [String(paymentDetails.id)]
         );
 
         if (result.rows.length > 0) {
-          await client.query(
+          await webhookClient.query(
             `INSERT INTO presentes (nome, comprado) VALUES ($1, TRUE) 
              ON CONFLICT (nome) DO UPDATE SET comprado = TRUE`,
             [result.rows[0].presente_nome]
           );
         }
       }
-      client.release();
+      webhookClient.release();
     } catch (error) {
       console.error('Erro no webhook:', error);
     }
@@ -128,4 +125,4 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`Backend a correr na porta ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Backend a correr na porta ${PORT}`));
